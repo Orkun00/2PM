@@ -14,12 +14,14 @@ What changed vs the originals
 -----------------------------
 * NO MORE input.csv / WeirdShape.csv. The scan path is generated on the fly as a
   centered RASTER grid (see generate_raster / pixel_to_voltage).
-* The "box" is fully parametric. You set pixels_x, pixels_y and step_size_deg in
-  the GUI.  Field of view (degrees) = (pixels - 1) * step_size_deg.
-  When you know your box limits, just change pixels + step size for the
-  resolution you want.
+* The "box" is fully parametric. You set FOV X, FOV Y (the total scan angle in
+  degrees for each axis) and step_size_deg in the GUI. Pixels are derived:
+      pixels = round(FOV / step_size_deg) + 1
+  Want a bigger area? raise the FOV. Want finer resolution? lower the step size.
 * Output voltage is HARD-CLAMPED to +/- voltage_limit (default 5 V) in code, and
-  the NI-DAQ AO channels are also created with that same +/- range.
+  the NI-DAQ AO channels are also created with that same +/- range. On top of
+  that, a scan whose corners would exceed the galvo's +/-22.5 deg (+/-5 V) limit
+  is REJECTED before it starts, so the requested FOV can never burn the galvo.
 * Everything runs from one GUI: set params -> Start -> live heatmap -> the
   original PMT plots -> save CSV (same columns as before).
 * If nidaqmx / H11890api.dll are missing (e.g. on macOS), the app drops into
@@ -81,16 +83,32 @@ except Exception:
 # ===========================================================================
 @dataclass
 class ScanConfig:
-    # --- the variables you'll tune for your box / resolution ---
-    pixels_x: int = 64          # number of pixels along X
-    pixels_y: int = 64          # number of pixels along Y
-    step_size_deg: float = 0.05  # degrees per pixel step (FOV = (pixels-1)*step)
+    # --- the variables you'll tune: field of view + resolution ---
+    # You give the FIELD OF VIEW in degrees (total angular width the beam
+    # sweeps) for each axis, plus the step size. Pixels are derived from these:
+    #     pixels = round(FOV / step) + 1
+    # so the scan is a centered raster covering +/- FOV/2 (around the offset).
+    fov_x_deg: float = 3.15      # total field of view along X (degrees)
+    fov_y_deg: float = 3.15      # total field of view along Y (degrees)
+    step_size_deg: float = 0.05  # degrees per pixel step
     x_offset_deg: float = 0.0   # shift the box center in X (degrees)
     y_offset_deg: float = 0.0   # shift the box center in Y (degrees)
 
     # --- galvo <-> voltage mapping (same idea as thisWorks.cpp) ---
-    voltage_limit: float = 5.0  # +/- output limit. Hard clamp AND DAQ channel range.
-    degree_range: float = 22.5  # degrees that correspond to voltage_limit (full scale)
+    # SAFETY: the galvo burns past +/- voltage_limit. degree_range degrees map to
+    # voltage_limit volts, so the beam must stay within +/- degree_range degrees.
+    voltage_limit: float = 5.0  # +/- output limit (V). Hard clamp AND DAQ channel range.
+    degree_range: float = 22.5  # degrees that correspond to voltage_limit (+/-5 V <-> +/-22.5 deg)
+
+    @property
+    def pixels_x(self) -> int:
+        """Number of pixels along X, derived from FOV and step size."""
+        return max(1, int(round(self.fov_x_deg / self.step_size_deg)) + 1)
+
+    @property
+    def pixels_y(self) -> int:
+        """Number of pixels along Y, derived from FOV and step size."""
+        return max(1, int(round(self.fov_y_deg / self.step_size_deg)) + 1)
 
     # --- timing ---
     settle_ms: int = 1          # wait after galvo move, before PMT read
@@ -606,8 +624,8 @@ class ScannerGUI:
 
         d = ScanConfig()
         r = 0
-        field(r, "Pixels X", "pixels_x", d.pixels_x); r += 1
-        field(r, "Pixels Y", "pixels_y", d.pixels_y); r += 1
+        field(r, "FOV X (deg)", "fov_x_deg", d.fov_x_deg); r += 1
+        field(r, "FOV Y (deg)", "fov_y_deg", d.fov_y_deg); r += 1
         field(r, "Step size (deg/px)", "step_size_deg", d.step_size_deg); r += 1
         field(r, "X offset (deg)", "x_offset_deg", d.x_offset_deg); r += 1
         field(r, "Y offset (deg)", "y_offset_deg", d.y_offset_deg); r += 1
@@ -681,8 +699,8 @@ class ScannerGUI:
     def _read_config(self):
         v = self.vars
         cfg = ScanConfig(
-            pixels_x=int(v["pixels_x"].get()),
-            pixels_y=int(v["pixels_y"].get()),
+            fov_x_deg=float(v["fov_x_deg"].get()),
+            fov_y_deg=float(v["fov_y_deg"].get()),
             step_size_deg=float(v["step_size_deg"].get()),
             x_offset_deg=float(v["x_offset_deg"].get()),
             y_offset_deg=float(v["y_offset_deg"].get()),
@@ -700,10 +718,39 @@ class ScannerGUI:
             output_csv=v["output_csv"].get().strip(),
             simulate=self.sim_var.get(),
         )
+
+        # --- basic sanity ---
+        if cfg.step_size_deg <= 0:
+            raise ValueError("Step size must be > 0")
+        if cfg.fov_x_deg < 0 or cfg.fov_y_deg < 0:
+            raise ValueError("FOV must be >= 0")
+        if cfg.degree_range <= 0:
+            raise ValueError("Degree range must be > 0")
         if cfg.pixels_x < 1 or cfg.pixels_y < 1:
-            raise ValueError("Pixels must be >= 1")
+            raise ValueError("FOV / step size produce fewer than 1 pixel")
+
+        # --- GALVO SAFETY ---
+        # The beam must never be commanded past +/- voltage_limit or it burns the
+        # galvo. voltage_limit is itself capped at 5 V. The furthest the beam
+        # reaches on each axis is half the (rounded) FOV plus the offset; convert
+        # that worst-case angle to a voltage and refuse the scan if it exceeds the
+        # limit -- rather than silently clamping and flattening the image edges.
         if cfg.voltage_limit > 5.0:
             raise ValueError("Voltage limit is capped at 5 V for galvo safety")
+
+        half_x = (cfg.pixels_x - 1) / 2.0 * cfg.step_size_deg
+        half_y = (cfg.pixels_y - 1) / 2.0 * cfg.step_size_deg
+        max_deg_x = half_x + abs(cfg.x_offset_deg)
+        max_deg_y = half_y + abs(cfg.y_offset_deg)
+        max_deg = max(max_deg_x, max_deg_y)
+        max_volt = cfg.voltage_limit * max_deg / cfg.degree_range
+
+        if max_deg > cfg.degree_range + 1e-9:
+            raise ValueError(
+                f"Scan reaches +/-{max_deg:.2f} deg ({max_volt:.2f} V), which "
+                f"exceeds the galvo limit of +/-{cfg.degree_range:.1f} deg "
+                f"(+/-{cfg.voltage_limit:.1f} V). Reduce FOV or offset to protect "
+                "the galvo.")
         return cfg
 
     # ----- hardware session (kept open across scans) -----
@@ -790,7 +837,9 @@ class ScannerGUI:
 
         est = cfg.pixels_x * cfg.pixels_y * (cfg.settle_ms + cfg.pmt_gate_time_ms) / 1000.0
         mode = "SIM" if cfg.simulate else "HARDWARE"
-        self.status.set(f"Scanning [{mode}]  ~{est:.1f}s estimated...")
+        self.status.set(
+            f"Scanning [{mode}]  {cfg.pixels_x}x{cfg.pixels_y} px "
+            f"({cfg.fov_x_deg:g}x{cfg.fov_y_deg:g} deg)  ~{est:.1f}s estimated...")
 
         self.stop_event.clear()
         self.engine = ScanEngine(cfg, self.galvo, self.pmt, self.q, self.stop_event)
