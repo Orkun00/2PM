@@ -169,11 +169,22 @@ class RealPMT:
             raise RuntimeError("Could not start PMT counting")
 
     def read(self):
+        import time as _time
         gate = ctypes.c_uint32(0)
         buf = (ctypes.c_uint32 * 16)()
         over = ctypes.c_int32(0)
+        _t0 = _time.perf_counter()
         n = self.dll.H11890ReadData(self.handle, ctypes.byref(gate), buf,
                                     ctypes.byref(over))
+        _usb_ms = 1e3 * (_time.perf_counter() - _t0)
+        # DIAGNOSTIC: time the raw USB/DLL call only. stdout is protocol-only,
+        # so log to a sibling file. Remove this block once the bottleneck is found.
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "pmt_timing.log"), "a") as _lf:
+                _lf.write(f"H11890ReadData {_usb_ms:.2f} ms\n")
+        except Exception:
+            pass
         if ctypes.c_int32(n).value < 0:
             return -1, 0, gate.value
         # one pixel per galvo position -> take the first gate's count
