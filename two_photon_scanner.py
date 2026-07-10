@@ -520,15 +520,36 @@ class ScanEngine(threading.Thread):
 
             self.pmt.start()
 
+            # --- per-pixel timing diagnostics (perf_counter, ms) ---
+            _t_write = _t_settle = _t_read = _t_pixels = 0.0
+
             for step, ix, iy, vx, vy in generate_raster(self.cfg):
                 if self.stop_event.is_set():
                     self.q.put(("done", "stopped"))
                     return
 
+                _t0 = time.perf_counter()
                 self.galvo.write(vx, vy)
+                _t1 = time.perf_counter()
                 time.sleep(self.cfg.settle_ms / 1000.0)
+                _t2 = time.perf_counter()
 
                 count, over, gate = self.pmt.read(vx, vy)
+                _t3 = time.perf_counter()
+
+                _t_write += _t1 - _t0
+                _t_settle += _t2 - _t1
+                _t_read += _t3 - _t2
+                _t_pixels += 1
+                if ix == self.cfg.pixels_x - 1:   # end of a row -> report averages
+                    print(f"[timing] row done  avg/pixel: "
+                          f"write={1e3*_t_write/_t_pixels:.2f}ms  "
+                          f"settle={1e3*_t_settle/_t_pixels:.2f}ms  "
+                          f"read={1e3*_t_read/_t_pixels:.2f}ms  "
+                          f"total={1e3*(_t_write+_t_settle+_t_read)/_t_pixels:.2f}ms",
+                          flush=True)
+                    _t_write = _t_settle = _t_read = _t_pixels = 0.0
+
                 dx, dy = pixel_to_degree(self.cfg, ix, iy)
 
                 if writer is not None:
