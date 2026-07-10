@@ -69,8 +69,12 @@ def load_h11890_dll(path):
             "Python, e.g.  py -3.13-32 pmt_helper.py  (the GUI does this for "
             "you via the 'Helper Python' field).")
 
-    # Resolve the path: as given, then relative to CWD, then next to this script.
-    here = os.path.dirname(os.path.abspath(__file__))
+    # Resolve the path: as given, then relative to CWD, then next to this
+    # script (or next to pmt_helper.exe when frozen by PyInstaller).
+    if getattr(sys, "frozen", False):
+        here = os.path.dirname(sys.executable)
+    else:
+        here = os.path.dirname(os.path.abspath(__file__))
     candidates = [path, os.path.abspath(path), os.path.join(here, path)]
     dll_file = next((c for c in candidates if os.path.isfile(c)), None)
     if dll_file is None:
@@ -169,26 +173,22 @@ class RealPMT:
             raise RuntimeError("Could not start PMT counting")
 
     def read(self):
-        import time as _time
         gate = ctypes.c_uint32(0)
         buf = (ctypes.c_uint32 * 16)()
         over = ctypes.c_int32(0)
-        _t0 = _time.perf_counter()
         n = self.dll.H11890ReadData(self.handle, ctypes.byref(gate), buf,
                                     ctypes.byref(over))
-        _usb_ms = 1e3 * (_time.perf_counter() - _t0)
-        # DIAGNOSTIC: time the raw USB/DLL call only. stdout is protocol-only,
-        # so log to a sibling file. Remove this block once the bottleneck is found.
-        try:
-            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   "pmt_timing.log"), "a") as _lf:
-                _lf.write(f"H11890ReadData {_usb_ms:.2f} ms\n")
-        except Exception:
-            pass
-        if ctypes.c_int32(n).value < 0:
+        n = ctypes.c_int32(n).value
+        if n < 0:
             return -1, 0, gate.value
-        # one pixel per galvo position -> take the first gate's count
-        return int(buf[0]), int(over.value), int(gate.value)
+        # The H11890 delivers gates in BATCHES: 15 gates per call when IT < 10 ms,
+        # else 1 (see the API function description PDF). The beam is parked on ONE
+        # pixel for the whole batch, so summing every returned gate integrates
+        # 15x longer for free -> ~15x better SNR at the same scan speed.
+        total = 0
+        for i in range(min(n, 16)):
+            total += int(buf[i])
+        return total, int(over.value), int(gate.value)
 
     def stop_counting(self):
         """Stop counting but leave the device OPEN for the next scan."""

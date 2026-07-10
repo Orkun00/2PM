@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller build output (see build_exe.bat)
+build/
+build_helper/
+dist/
+dist_helper/
+*.spec
+
+# Scan output
+*.csv.part
+pmt_timing.log

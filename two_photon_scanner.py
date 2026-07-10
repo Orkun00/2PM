@@ -46,6 +46,7 @@ Run on the Windows rig:
 """
 
 import os
+import sys
 import csv
 import json
 import time
@@ -71,7 +72,10 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 # ---------------------------------------------------------------------------
 try:
     import nidaqmx
-    HAVE_NIDAQMX = True
+    # The nidaqmx PACKAGE installs anywhere, but the NI-DAQmx driver does not
+    # support macOS -- creating a Task would always fail. Treat that as "no
+    # hardware" so the app defaults to simulation off the rig, as intended.
+    HAVE_NIDAQMX = sys.platform != "darwin"
 except Exception:
     HAVE_NIDAQMX = False
 
@@ -97,14 +101,29 @@ class ScanConfig:
     pmt_gate_time_ms: int = 1   # H11890 IT (gate/integration time), 1 ms minimum
     pmt_gate_number: int = 0    # H11890 RN (0 = continuous)
 
+    # --- laser watchdog ---
+    # If a pixel's count falls below this, assume the laser stopped: pause the
+    # scan (hold position) and resume automatically when the signal recovers.
+    # 0 disables the watchdog. NOTE: counts are 15-gate sums, so set this well
+    # below your typical per-pixel signal but above the dark count (~1-15).
+    laser_min_count: int = 0
+
     # --- scan shape ---
-    serpentine: bool = True     # snake scan (reverse every other row) to cut flyback
+    # Unidirectional by default: every row scans left->right so any fixed
+    # galvo/PMT time-lag becomes a uniform sub-pixel shift of the whole image
+    # instead of an alternating 1-pixel row-to-row "comb" artifact. Serpentine
+    # (snake) only saves galvo flyback, which is negligible here since the scan
+    # is PMT-time-limited (~15 ms/pixel), not flyback-limited.
+    serpentine: bool = False    # snake scan (reverse every other row) to cut flyback
 
     # --- hardware addressing ---
     channel_x: str = "Dev1/ao0"
     channel_y: str = "Dev1/ao1"
     dll_path: str = "H11890api.dll"
-    pmt_hv_on: bool = True
+    # SAFETY: high voltage starts OFF. The device opens (and the live monitor
+    # runs) with HV off; the user must tick "PMT high voltage ON" to energize
+    # the PMT -- prevents accidentally burning it with room light at startup.
+    pmt_hv_on: bool = False
 
     # --- 32-bit PMT helper (loads H11890api.dll out-of-process) ---
     # Command used to launch pmt_helper.py with a 32-BIT Python interpreter.
@@ -283,12 +302,21 @@ class SimPMT:
         """Hard-stop counterpart of SubprocessPMT.kill (no-op in sim)."""
         pass
 
+    def reopen(self):
+        """Relaunch after a device drop (no-op in sim)."""
+        pass
+
+    def set_hv(self, on):
+        """Emergency HV control (no-op in sim)."""
+        pass
+
     def read(self, vx, vy):
         r2 = vx * vx + vy * vy
         base = 5000.0 * np.exp(-r2 / (2.0 * 0.8 ** 2))
-        count = int(self.rng.poisson(base + 50))
-        over = 1 if count > 60000 else 0
-        self.gate += 1
+        # mimic the real helper: each read is the SUM of a 15 x 1 ms gate batch
+        count = int(self.rng.poisson((base + 50) * 15))
+        over = 1 if count > 60000 * 15 else 0
+        self.gate += 15
         return count, over, self.gate
 
     def close(self):
@@ -311,39 +339,66 @@ class SubprocessPMT:
     """Drives the Hamamatsu H11890 via the out-of-process 32-bit helper."""
 
     def __init__(self, cfg: ScanConfig):
-        here = os.path.dirname(os.path.abspath(__file__))
-        helper = os.path.join(here, "pmt_helper.py")
-        if not os.path.isfile(helper):
-            raise FileNotFoundError(f"pmt_helper.py not found next to the GUI: {helper}")
+        self.cfg = cfg
+        self.proc = None
+        # One lock serializes all RPCs on the helper pipe: the scan thread
+        # reads constantly, and the GUI may interleave an emergency HV-off or
+        # reconfigure on the same pipe -- two unserialized commands would
+        # desync request/reply pairing.
+        self._lock = threading.Lock()
+        self._launch(cfg)
 
-        # "py -3.13-32"  ->  ["py", "-3.13-32"];  full exe path also works.
-        try:
-            launcher = shlex.split(cfg.helper_python, posix=False)
-        except Exception:
-            launcher = cfg.helper_python.split()
-        if not launcher:
-            raise ValueError("Helper Python command is empty")
-        # shlex(posix=False) keeps surrounding quotes -> strip them.
-        launcher = [tok.strip('"') for tok in launcher]
+    def _launch(self, cfg: ScanConfig):
+        """(Re)start the 32-bit helper process and open+configure the device."""
+        # When frozen by PyInstaller, __file__ points inside the bundle; the
+        # helper + DLL are shipped next to the .exe instead.
+        if getattr(sys, "frozen", False):
+            here = os.path.dirname(sys.executable)
+        else:
+            here = os.path.dirname(os.path.abspath(__file__))
 
-        # Resolve to the REAL python.exe. The 'py' launcher (py -3.13-32) is a
-        # separate process that spawns python.exe as a CHILD -- if we Popen the
-        # launcher, self.proc is py.exe and killing it ORPHANS the real helper,
-        # which keeps holding the USB device (a zombie that blocks re-opening).
-        # Launching the interpreter directly makes self.proc the helper itself.
-        interp = self._resolve_interpreter(launcher)
+        helper_exe = os.path.join(here, "pmt_helper.exe")
+        helper_py = os.path.join(here, "pmt_helper.py")
+
+        if os.path.isfile(helper_exe):
+            # Standalone 32-bit helper exe (built by build_exe.bat): users
+            # don't need any Python installed.
+            cmd = [helper_exe]
+        elif os.path.isfile(helper_py):
+            # Script mode: run pmt_helper.py with a 32-bit Python.
+            # "py -3.13-32"  ->  ["py", "-3.13-32"];  full exe path also works.
+            try:
+                launcher = shlex.split(cfg.helper_python, posix=False)
+            except Exception:
+                launcher = cfg.helper_python.split()
+            if not launcher:
+                raise ValueError("Helper Python command is empty")
+            # shlex(posix=False) keeps surrounding quotes -> strip them.
+            launcher = [tok.strip('"') for tok in launcher]
+
+            # Resolve to the REAL python.exe. The 'py' launcher (py -3.13-32) is a
+            # separate process that spawns python.exe as a CHILD -- if we Popen the
+            # launcher, self.proc is py.exe and killing it ORPHANS the real helper,
+            # which keeps holding the USB device (a zombie that blocks re-opening).
+            # Launching the interpreter directly makes self.proc the helper itself.
+            interp = self._resolve_interpreter(launcher)
+            cmd = interp + ["-u", helper_py]
+        else:
+            raise FileNotFoundError(
+                f"Neither pmt_helper.exe nor pmt_helper.py found next to the GUI: {here}")
 
         try:
             self.proc = subprocess.Popen(
-                interp + ["-u", helper],
+                cmd,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 cwd=here, text=True, bufsize=1, creationflags=_NO_WINDOW,
             )
         except (FileNotFoundError, OSError) as e:
             raise RuntimeError(
-                f"Could not launch the 32-bit PMT helper with {cfg.helper_python!r}. "
-                "Check the 'Helper Python' field -- it must point at a 32-bit "
-                "Python (e.g. 'py -3.13-32' or a full python.exe path).") from e
+                f"Could not launch the 32-bit PMT helper ({cmd[0]!r}). "
+                "If running from source, check the 'Helper Python' field -- it "
+                "must point at a 32-bit Python (e.g. 'py -3.13-32' or a full "
+                "python.exe path).") from e
 
         # Sanity check: the helper must really be 32-bit, or the DLL won't load.
         r = self._rpc({"cmd": "ping"})
@@ -389,22 +444,23 @@ class SubprocessPMT:
         poll'). Using the local also keeps the pipe handles valid for the calls
         below even if self.proc is cleared mid-way.
         """
-        p = self.proc
-        if p is None or p.poll() is not None:
-            raise RuntimeError("PMT helper is not running.\n" + self._drain_stderr(p))
-        try:
-            p.stdin.write(json.dumps(obj) + "\n")
-            p.stdin.flush()
-        except (BrokenPipeError, OSError, ValueError):
-            raise RuntimeError("PMT helper pipe closed.\n" + self._drain_stderr(p))
+        with self._lock:
+            p = self.proc
+            if p is None or p.poll() is not None:
+                raise RuntimeError("PMT helper is not running.\n" + self._drain_stderr(p))
+            try:
+                p.stdin.write(json.dumps(obj) + "\n")
+                p.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                raise RuntimeError("PMT helper pipe closed.\n" + self._drain_stderr(p))
 
-        line = p.stdout.readline()
-        if not line:   # EOF -> the helper died; its traceback is on stderr
-            raise RuntimeError("PMT helper sent no reply.\n" + self._drain_stderr(p))
-        try:
-            return json.loads(line)
-        except Exception:
-            return {"ok": False, "error": f"bad reply from helper: {line!r}"}
+            line = p.stdout.readline()
+            if not line:   # EOF -> the helper died; its traceback is on stderr
+                raise RuntimeError("PMT helper sent no reply.\n" + self._drain_stderr(p))
+            try:
+                return json.loads(line)
+            except Exception:
+                return {"ok": False, "error": f"bad reply from helper: {line!r}"}
 
     def _drain_stderr(self, p=None):
         """Read whatever the (now-exited) helper wrote to stderr, for the error."""
@@ -430,11 +486,30 @@ class SubprocessPMT:
 
     def reconfigure(self, cfg: ScanConfig):
         """Re-apply gate time / gate number / HV without reopening the device."""
+        self.cfg = cfg
         r = self._rpc({"cmd": "reconfig", "it": cfg.pmt_gate_time_ms,
                        "rn": cfg.pmt_gate_number,
                        "hvon": 1 if cfg.pmt_hv_on else 0})
         if not r.get("ok"):
             raise RuntimeError("PMT reconfigure failed: " + r.get("error", "unknown"))
+
+    def reopen(self):
+        """Hard-restart the helper + device after a USB drop / driver wedge.
+
+        kill() also makes Windows release the USB handle, so the fresh helper
+        can re-open the device.
+        """
+        self.kill()
+        self._launch(self.cfg)
+
+    def set_hv(self, on: bool):
+        """Set the PMT high voltage NOW. Safe mid-scan: the RPC lock serializes
+        this with the scan thread's reads on the shared pipe."""
+        self.cfg.pmt_hv_on = bool(on)
+        r = self._rpc({"cmd": "reconfig", "it": self.cfg.pmt_gate_time_ms,
+                       "rn": self.cfg.pmt_gate_number, "hvon": 1 if on else 0})
+        if not r.get("ok"):
+            raise RuntimeError("PMT HV change failed: " + r.get("error", "unknown"))
 
     def read(self, vx, vy):
         r = self._rpc({"cmd": "read"})
@@ -507,12 +582,64 @@ class ScanEngine(threading.Thread):
         self.q = out_queue
         self.stop_event = stop_event
 
+    def _read_recover(self, vx, vy):
+        """pmt.read with automatic reconnect after a USB/driver drop.
+
+        The H11890 driver occasionally wedges or the device drops off USB.
+        Instead of killing the whole scan, restart the helper + device (up to
+        3 tries) and re-read this pixel; the galvo hasn't moved, so nothing
+        is lost.
+        """
+        try:
+            count, over, gate = self.pmt.read(vx, vy)
+            if count >= 0:
+                return count, over, gate
+            err = "device returned a read error"
+        except Exception as e:
+            err = str(e)
+        for attempt in (1, 2, 3):
+            if self.stop_event.is_set():
+                break
+            self.q.put(("status",
+                        f"PMT problem ({err}) - reconnecting {attempt}/3..."))
+            try:
+                self.pmt.reopen()
+                self.pmt.start()
+                count, over, gate = self.pmt.read(vx, vy)
+                if count >= 0:
+                    self.q.put(("status", "PMT reconnected - scan continues."))
+                    return count, over, gate
+                err = "device returned a read error"
+            except Exception as e:
+                err = str(e)
+            time.sleep(2.0)
+        raise RuntimeError("PMT unrecoverable after 3 reconnect attempts: " + err)
+
+    def _read_pixel(self, vx, vy):
+        """Read one pixel. If the count is below the laser-off threshold, hold
+        this galvo position and keep polling until the signal comes back, then
+        resume the scan exactly where it left off."""
+        count, over, gate = self._read_recover(vx, vy)
+        thr = self.cfg.laser_min_count
+        if thr > 0 and count < thr:
+            self.q.put(("status",
+                        f"Signal {count} < {thr}: laser off? Scan PAUSED, waiting..."))
+            while not self.stop_event.is_set():
+                time.sleep(0.5)
+                count, over, gate = self._read_recover(vx, vy)
+                if count >= thr:
+                    self.q.put(("status", "Signal recovered - scan resumed."))
+                    break
+        return count, over, gate
+
     def run(self):
         writer = None
         f = None
         try:
             if self.cfg.output_csv:
-                f = open(self.cfg.output_csv, "w", newline="")
+                # Stream to a .part file; when the scan ends the GUI asks
+                # "save or skip?" and renames or deletes it.
+                f = open(self.cfg.output_csv + ".part", "w", newline="")
                 writer = csv.writer(f)
                 writer.writerow(["step", "x_deg", "y_deg", "x_voltage",
                                  "y_voltage", "gate_number", "pmt_count",
@@ -520,36 +647,15 @@ class ScanEngine(threading.Thread):
 
             self.pmt.start()
 
-            # --- per-pixel timing diagnostics (perf_counter, ms) ---
-            _t_write = _t_settle = _t_read = _t_pixels = 0.0
-
             for step, ix, iy, vx, vy in generate_raster(self.cfg):
                 if self.stop_event.is_set():
                     self.q.put(("done", "stopped"))
                     return
 
-                _t0 = time.perf_counter()
                 self.galvo.write(vx, vy)
-                _t1 = time.perf_counter()
                 time.sleep(self.cfg.settle_ms / 1000.0)
-                _t2 = time.perf_counter()
 
-                count, over, gate = self.pmt.read(vx, vy)
-                _t3 = time.perf_counter()
-
-                _t_write += _t1 - _t0
-                _t_settle += _t2 - _t1
-                _t_read += _t3 - _t2
-                _t_pixels += 1
-                if ix == self.cfg.pixels_x - 1:   # end of a row -> report averages
-                    print(f"[timing] row done  avg/pixel: "
-                          f"write={1e3*_t_write/_t_pixels:.2f}ms  "
-                          f"settle={1e3*_t_settle/_t_pixels:.2f}ms  "
-                          f"read={1e3*_t_read/_t_pixels:.2f}ms  "
-                          f"total={1e3*(_t_write+_t_settle+_t_read)/_t_pixels:.2f}ms",
-                          flush=True)
-                    _t_write = _t_settle = _t_read = _t_pixels = 0.0
-
+                count, over, gate = self._read_pixel(vx, vy)
                 dx, dy = pixel_to_degree(self.cfg, ix, iy)
 
                 if writer is not None:
@@ -591,6 +697,14 @@ class ScannerGUI:
         self.engine = None
         self._stop_deadline = 0.0
 
+        # --- always-on live PMT monitor state ---
+        # Plain attributes (not tk vars) because the monitor thread reads them.
+        self._scan_active = False   # True while a scan owns the PMT
+        self._mon_on = True         # mirrors the "Live PMT monitor" checkbox
+        self._mon_idle = threading.Event()  # set = monitor parked, scan may start
+        self._opening = False       # an async auto-connect is in flight
+        self._closing = False
+
         # Persistent hardware, kept open ACROSS scans (see on_start). Re-opened
         # only when a device-level setting changes; closed on app exit.
         self.galvo = None
@@ -604,6 +718,8 @@ class ScannerGUI:
 
         self._build_widgets()
         self._poll_queue()
+        # Live PMT readout: runs for the whole app lifetime, no button needed.
+        threading.Thread(target=self._monitor_loop, daemon=True).start()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ----- layout -----
@@ -637,6 +753,10 @@ class ScannerGUI:
         field(r, "Settle (ms)", "settle_ms", d.settle_ms); r += 1
         field(r, "PMT gate time (ms)", "pmt_gate_time_ms", d.pmt_gate_time_ms); r += 1
         field(r, "PMT gate number", "pmt_gate_number", d.pmt_gate_number); r += 1
+        field(r, "Laser-off threshold (0=off)", "laser_min_count",
+              d.laser_min_count); r += 1
+        field(r, "Scale min (manual)", "scale_min", 0); r += 1
+        field(r, "Scale max (manual)", "scale_max", 1000); r += 1
         field(r, "X channel", "channel_x", d.channel_x, width=14); r += 1
         field(r, "Y channel", "channel_y", d.channel_y, width=14); r += 1
         field(r, "PMT DLL path", "dll_path", d.dll_path, width=14); r += 1
@@ -650,13 +770,21 @@ class ScannerGUI:
 
         self.hv_var = tk.BooleanVar(value=d.pmt_hv_on)
         ttk.Checkbutton(params, text="PMT high voltage ON",
-                        variable=self.hv_var).grid(row=r, column=0, columnspan=2,
-                                                   sticky="w", pady=2); r += 1
+                        variable=self.hv_var,
+                        command=self.on_hv_toggle).grid(
+                            row=r, column=0, columnspan=2,
+                            sticky="w", pady=2); r += 1
 
         self.sim_var = tk.BooleanVar(value=d.simulate)
         ttk.Checkbutton(params, text="Simulation mode (no hardware)",
                         variable=self.sim_var).grid(row=r, column=0, columnspan=2,
                                                     sticky="w", pady=2); r += 1
+
+        self.autoscale_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(params, text="Auto colour scale",
+                        variable=self.autoscale_var,
+                        command=self._refresh_image).grid(
+                            row=r, column=0, columnspan=2, sticky="w", pady=2); r += 1
 
         # ---- buttons ----
         btns = ttk.Frame(params)
@@ -671,12 +799,28 @@ class ScannerGUI:
         ttk.Button(btns, text="Save CSV as...", command=self.save_csv_as).pack(
             side="left", padx=2)
 
+        btns2 = ttk.Frame(params)
+        btns2.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(4, 0)); r += 1
+        # Emergency HV kill: plain tk.Button so it can be red and unmissable.
+        tk.Button(btns2, text="HV OFF", command=self.on_hv_off,
+                  bg="#b00020", fg="white",
+                  activebackground="#8a0018", activeforeground="white").pack(
+            side="left", padx=2)
+        self.monitor_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(btns2, text="Live PMT monitor",
+                        variable=self.monitor_var,
+                        command=self._on_monitor_toggle).pack(side="left", padx=6)
+
         # ---- status ----
         self.status = tk.StringVar(
             value="Ready" + ("" if HAVE_NIDAQMX else "  (nidaqmx not found -> simulation)"))
         ttk.Label(params, textvariable=self.status, wraplength=240,
                   foreground="#0a6").grid(row=r, column=0, columnspan=2,
                                           sticky="w", pady=(8, 0)); r += 1
+        self.live_var = tk.StringVar(value="PMT live: -")
+        ttk.Label(params, textvariable=self.live_var,
+                  font=("TkDefaultFont", 10, "bold")).grid(
+                      row=r, column=0, columnspan=2, sticky="w"); r += 1
         self.progress = ttk.Progressbar(params, length=240, mode="determinate")
         self.progress.grid(row=r, column=0, columnspan=2, sticky="ew", pady=4)
 
@@ -712,6 +856,7 @@ class ScannerGUI:
             settle_ms=int(v["settle_ms"].get()),
             pmt_gate_time_ms=int(v["pmt_gate_time_ms"].get()),
             pmt_gate_number=int(v["pmt_gate_number"].get()),
+            laser_min_count=int(v["laser_min_count"].get()),
             serpentine=self.serp_var.get(),
             channel_x=v["channel_x"].get().strip(),
             channel_y=v["channel_y"].get().strip(),
@@ -769,6 +914,9 @@ class ScannerGUI:
 
     # ----- start / stop -----
     def on_start(self):
+        if self._opening:
+            self.status.set("PMT is auto-connecting - try again in a moment.")
+            return
         # Make sure the PREVIOUS scan thread is completely finished before we
         # touch the PMT pipe again -- its cleanup runs a PMT command on the same
         # pipe, and overlapping two commands would desync it. If that thread is
@@ -788,6 +936,11 @@ class ScannerGUI:
             messagebox.showerror("Bad parameters", str(e))
             return
 
+        # Park the live monitor: the scan owns the PMT from here (otherwise the
+        # monitor would steal 15-gate batches meant for scan pixels).
+        self._scan_active = True
+        self._mon_idle.wait(2.0)
+
         # Open hardware once and reuse it. Only re-open when a device-level
         # setting changed; otherwise just re-apply the PMT gate/HV settings.
         try:
@@ -798,6 +951,7 @@ class ScannerGUI:
             else:
                 self.pmt.reconfigure(cfg)
         except Exception as e:
+            self._scan_active = False   # un-park the monitor
             self._close_hardware()
             messagebox.showerror("Hardware init failed", str(e))
             return
@@ -809,7 +963,11 @@ class ScannerGUI:
         self._init_image()
         self.progress.configure(maximum=cfg.pixels_x * cfg.pixels_y, value=0)
 
-        est = cfg.pixels_x * cfg.pixels_y * (cfg.settle_ms + cfg.pmt_gate_time_ms) / 1000.0
+        # H11890 delivers 15 gates per read when IT < 10 ms (else 1), so each
+        # pixel really costs settle + 15*IT.
+        gates_per_read = 15 if cfg.pmt_gate_time_ms < 10 else 1
+        est = cfg.pixels_x * cfg.pixels_y \
+            * (cfg.settle_ms + gates_per_read * cfg.pmt_gate_time_ms) / 1000.0
         mode = "SIM" if cfg.simulate else "HARDWARE"
         self.status.set(f"Scanning [{mode}]  ~{est:.1f}s estimated...")
 
@@ -842,12 +1000,126 @@ class ScannerGUI:
             self._close_hardware(force=True)
             self.engine.join(timeout=3)
             self.engine = None
+            self._scan_active = False   # let the monitor auto-reconnect
             self.start_btn.configure(state="normal")
             return
         self.root.after(300, self._stop_watchdog)
 
+    def on_hv_off(self):
+        """EMERGENCY: force the PMT high voltage OFF immediately.
+
+        Works mid-scan too -- SubprocessPMT's RPC lock serializes this with the
+        scan thread's reads. Runs in a worker thread so a wedged helper can
+        never freeze the GUI (the wedge-recovery watchdogs handle that case).
+        """
+        self.hv_var.set(False)   # next scan/reconfigure also keeps HV off
+        pmt = self.pmt
+        if pmt is None:
+            self.status.set("HV OFF: no device open - will apply on next open.")
+            return
+        def worker():
+            try:
+                pmt.set_hv(False)
+                self.q.put(("status", "PMT HIGH VOLTAGE IS OFF."))
+            except Exception as e:
+                self.q.put(("status", f"HV OFF failed: {e}"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_hv_toggle(self):
+        """Apply the HV checkbox IMMEDIATELY (not only at the next scan).
+
+        HV starts OFF for safety; ticking the box energizes the PMT right away
+        so the live monitor starts showing real counts. Runs in a worker thread
+        so a wedged helper can't freeze the GUI.
+        """
+        want = self.hv_var.get()
+        pmt = self.pmt
+        if pmt is None:
+            self.status.set(f"HV {'ON' if want else 'OFF'}: will apply when "
+                            "the device opens.")
+            return
+        def worker():
+            try:
+                pmt.set_hv(want)
+                self.q.put(("status", f"PMT high voltage {'ON' if want else 'OFF'}."))
+            except Exception as e:
+                self.q.put(("status", f"HV change failed: {e}"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ----- always-on live PMT monitor -----
+    def _on_monitor_toggle(self):
+        self._mon_on = self.monitor_var.get()
+        if not self._mon_on:
+            self.live_var.set("PMT live: (monitor off)")
+
+    def _monitor_loop(self):
+        """Background thread: keep reading the PMT and showing it live.
+
+        Runs whenever no scan is active, so the readout is always on screen
+        without pressing anything. If no device is open yet it asks the GUI
+        thread to auto-connect (and silently retries). It PARKS during scans
+        (signalled via _mon_idle) so it can never steal 15-gate batches that
+        belong to scan pixels -- during a scan the per-pixel messages update
+        the same label instead. Never touches tk widgets directly; everything
+        goes through the queue.
+        """
+        need_start = True
+        last_open_req = 0.0
+        while not self._closing:
+            if not self._mon_on or self._scan_active:
+                self._mon_idle.set()
+                need_start = True   # scan's cleanup calls pmt.stop()
+                time.sleep(0.3)
+                continue
+            pmt = self.pmt
+            if pmt is None:
+                self._mon_idle.set()
+                need_start = True
+                now = time.time()
+                if not self._opening and now - last_open_req > 5.0:
+                    last_open_req = now
+                    self.q.put(("need_open",))
+                time.sleep(0.5)
+                continue
+            self._mon_idle.clear()
+            try:
+                if need_start:
+                    pmt.start()
+                    need_start = False
+                count, over, gate = pmt.read(0.0, 0.0)
+                self.q.put(("live", count, over))
+            except Exception as e:
+                need_start = True
+                self.q.put(("live_err", f"read failed ({e})"))
+                time.sleep(1.0)
+            time.sleep(0.05)   # ~15 Hz; the real read also blocks ~15 ms
+        self._mon_idle.set()
+
+    def _auto_open_async(self):
+        """Open the hardware in a worker thread so live monitoring starts by
+        itself. Failures are silent (label shows 'not connected', retries)."""
+        if self._opening or self._scan_active or self.pmt is not None:
+            return
+        try:
+            cfg = self._read_config()
+        except Exception:
+            return   # half-edited parameters -> just try again later
+        self._opening = True
+        self.live_var.set("PMT live: connecting...")
+        def worker():
+            try:
+                self._open_hardware(cfg)
+                self.q.put(("status", "Device connected - live PMT monitor on."))
+            except Exception:
+                self.q.put(("live_err", "not connected (retrying...)"))
+            finally:
+                self._opening = False
+        threading.Thread(target=worker, daemon=True).start()
+
     def on_close(self):
         """Stop any running scan and fully release hardware before quitting."""
+        self._closing = True          # stop the live monitor thread
+        self._scan_active = True      # keep it from touching the PMT meanwhile
         self.stop_event.set()
         if self.engine is not None:
             self.engine.join(timeout=3)
@@ -866,10 +1138,17 @@ class ScannerGUI:
         self.ax.set_title("PMT intensity")
         cmap = plt.get_cmap("viridis").copy()
         cmap.set_bad(color="#202020")  # unscanned pixels
+        ext = degree_extent(self.cfg)
+        # origin="upper" + swapped y-extent: row 0 (first scanned row) draws at
+        # the TOP-left like a normal photo, so the PMT image compares 1:1 with
+        # a camera view of the sample.
         self.im = self.ax.imshow(
-            self.image, origin="lower", aspect="equal", cmap=cmap,
-            extent=degree_extent(self.cfg),
+            self.image, origin="upper", aspect="equal", cmap=cmap,
+            extent=[ext[0], ext[1], ext[3], ext[2]],
         )
+        # Placeholder clim: an all-NaN image must not autoscale to a bogus
+        # (e.g. -0.1..0.1) colorbar before the first pixel arrives.
+        self.im.set_clim(0.0, 1.0)
         if self.cbar is None:
             self.cbar = self.fig.colorbar(self.im, ax=self.ax, label="PMT count")
         else:
@@ -880,9 +1159,28 @@ class ScannerGUI:
         if self.im is None:
             return
         self.im.set_data(self.image)
-        finite = self.image[np.isfinite(self.image)]
-        if finite.size:
-            self.im.set_clim(vmin=float(finite.min()), vmax=float(finite.max()))
+        vmin = vmax = None
+        if self.autoscale_var.get():
+            finite = self.image[np.isfinite(self.image)]
+            if finite.size:
+                vmin = max(0.0, float(finite.min()))   # counts are never negative
+                vmax = float(finite.max())
+        else:
+            # Manual scale: one hot pixel can't blow out the whole display.
+            try:
+                vmin = float(self.vars["scale_min"].get())
+                vmax = float(self.vars["scale_max"].get())
+            except (ValueError, KeyError):
+                pass   # bad manual entry -> keep the last scale
+        if vmin is not None and vmax is not None:
+            if vmax <= vmin:
+                # A degenerate clim (all pixels equal, e.g. all 0) makes
+                # matplotlib expand it to +/-0.1 -> the "negative PMT count"
+                # scale bug. Force a real range instead.
+                vmax = vmin + 1.0
+            self.im.set_clim(vmin=vmin, vmax=vmax)
+            if self.cbar is not None:
+                self.cbar.update_normal(self.im)   # keep colorbar in sync
         self.canvas.draw_idle()
 
     # ----- queue pump (GUI thread) -----
@@ -901,16 +1199,35 @@ class ScannerGUI:
                                              dx=dx, dy=dy,
                                              count=count, over=over))
                     self.progress.configure(value=step + 1)
+                    self.live_var.set(f"PMT live: {count}"
+                                      + ("  OVER LIGHT!" if over else ""))
                     dirty = True
+                elif kind == "status":
+                    self.status.set(msg[1])
+                elif kind == "live":
+                    # only from the monitor thread; drop stale ones queued
+                    # just before the monitor was toggled off
+                    if self._mon_on:
+                        _, count, over = msg
+                        self.live_var.set(f"PMT live: {count}"
+                                          + ("  OVER LIGHT!" if over else ""))
+                elif kind == "live_err":
+                    if self._mon_on:
+                        self.live_var.set(f"PMT live: {msg[1]}")
+                elif kind == "need_open":
+                    self._auto_open_async()
                 elif kind == "done":
                     self._refresh_image()
                     self.status.set(f"Done ({msg[1]}). {len(self.records)} points.")
                     self.start_btn.configure(state="normal")
                     self.stop_btn.configure(state="disabled")
+                    self._scan_active = False   # hand the PMT back to the monitor
+                    self._ask_save(msg[1])
                 elif kind == "error":
                     self._refresh_image()
                     self.start_btn.configure(state="normal")
                     self.stop_btn.configure(state="disabled")
+                    self._scan_active = False   # hand the PMT back to the monitor
                     # The device may be in a bad state (e.g. helper crashed);
                     # drop it so the next Start re-opens cleanly.
                     if self.engine is not None:
@@ -930,6 +1247,33 @@ class ScannerGUI:
             self._refresh_image()
         self.root.after(80, self._poll_queue)
 
+    # ----- post-scan save/skip -----
+    def _ask_save(self, reason):
+        """The scan streamed its rows to <output_csv>.part; ask whether to keep
+        them. The data also stays in memory, so 'Save CSV as...' still works
+        even after choosing skip."""
+        if self.cfg is None or not self.cfg.output_csv:
+            return
+        tmp = self.cfg.output_csv + ".part"
+        if not os.path.isfile(tmp):
+            return
+        if self.records and messagebox.askyesno(
+                "Save scan?",
+                f"Scan {reason}: {len(self.records)} points.\n\n"
+                f"Save to {self.cfg.output_csv}?\n"
+                "(Skip keeps the data in memory - you can still use "
+                "'Save CSV as...')"):
+            os.replace(tmp, self.cfg.output_csv)
+            self.status.set(f"Saved {len(self.records)} points -> "
+                            f"{os.path.basename(self.cfg.output_csv)}")
+        else:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            self.status.set(f"Done ({reason}) - CSV skipped "
+                            "(data still in memory).")
+
     # ----- the pmtPlot.py plots, from in-memory data -----
     def show_plots(self):
         if not self.records:
@@ -948,13 +1292,15 @@ class ScannerGUI:
         plt.xlabel("Step"); plt.ylabel("PMT Count")
         plt.title("PMT Signal Over Scan"); plt.grid(True)
 
-        # 2) 2D scatter intensity map
+        # 2) 2D scatter intensity map (y inverted -> top-left origin, like the
+        #    live heatmap / a camera photo)
         plt.figure(figsize=(8, 7))
         sc = plt.scatter(xs, ys, c=counts, s=40)
         plt.colorbar(sc, label="PMT Count")
         plt.xlabel("X angle (deg)"); plt.ylabel("Y angle (deg)")
         plt.title("2D PMT Intensity Map")
         plt.axis("equal"); plt.grid(True)
+        plt.gca().invert_yaxis()
 
         # 3) over-light map
         if np.any(overs == 1):
@@ -966,12 +1312,14 @@ class ScannerGUI:
             plt.xlabel("X angle (deg)"); plt.ylabel("Y angle (deg)")
             plt.title("PMT Map with OverLight Detection")
             plt.legend(); plt.axis("equal"); plt.grid(True)
+            plt.gca().invert_yaxis()
 
-        # 4) heatmap
+        # 4) heatmap (top-left origin, like a photo)
         plt.figure(figsize=(8, 7))
         img = np.nan_to_num(self.image, nan=0.0)
-        plt.imshow(img, origin="lower", aspect="auto",
-                   extent=degree_extent(self.cfg))
+        ext = degree_extent(self.cfg)
+        plt.imshow(img, origin="upper", aspect="auto",
+                   extent=[ext[0], ext[1], ext[3], ext[2]])
         plt.colorbar(label="PMT Count")
         plt.title("PMT Heatmap")
         plt.xlabel("X angle (deg)"); plt.ylabel("Y angle (deg)")
