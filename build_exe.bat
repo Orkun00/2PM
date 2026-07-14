@@ -22,27 +22,51 @@ REM ============================================================
 
 cd /d "%~dp0"
 
+REM The running GUI locks its files in dist\ -- PyInstaller would fail
+REM half-way and leave a BROKEN exe ("Failed to load Python DLL").
+tasklist /FI "IMAGENAME eq TwoPhotonScanner.exe" | find /I "TwoPhotonScanner.exe" >nul
+if not errorlevel 1 (
+    echo.
+    echo ERROR: TwoPhotonScanner.exe is still running. Close it, then re-run.
+    goto :err
+)
+REM A leftover PMT helper (its GUI already gone) locks dist\ the same way.
+taskkill /F /IM pmt_helper.exe >nul 2>&1
+
 echo.
-echo ==== [1/3] Building 32-bit PMT helper (pmt_helper.exe) ====
+echo ==== [1/4] Building 32-bit PMT helper (pmt_helper.exe) ====
 py -3.13-32 -m pip install --upgrade pyinstaller || goto :err
-py -3.13-32 -m PyInstaller --onefile --name pmt_helper ^
+py -3.13-32 -m PyInstaller --noconfirm --onefile --name pmt_helper ^
     --distpath dist_helper --workpath build_helper pmt_helper.py || goto :err
 
 echo.
-echo ==== [2/3] Building 64-bit GUI (TwoPhotonScanner.exe) ====
+echo ==== [2/4] Building 64-bit GUI (TwoPhotonScanner.exe) ====
+REM --recursive-copy-metadata nidaqmx: nidaqmx (and its deps, e.g. nitypes)
+REM read their version from package metadata at import time; without the
+REM metadata bundled the frozen exe fails with "nidaqmx not installed".
 py -3-64 -m pip install --upgrade pyinstaller || goto :err
-py -3-64 -m PyInstaller --windowed --name TwoPhotonScanner ^
+py -3-64 -m PyInstaller --noconfirm --windowed --name TwoPhotonScanner ^
+    --recursive-copy-metadata nidaqmx ^
     two_photon_scanner.py || goto :err
 
 echo.
-echo ==== [3/3] Assembling the final folder ====
+echo ==== [3/4] Assembling the final folder ====
 copy /Y dist_helper\pmt_helper.exe dist\TwoPhotonScanner\ || goto :err
 copy /Y H11890api.dll dist\TwoPhotonScanner\ || goto :err
 
 echo.
+echo ==== [4/4] Removing intermediate build folders ====
+REM The exe inside build\TwoPhotonScanner\ is a PyInstaller WORK FILE -- it
+REM cannot run ("Failed to load Python DLL"). Delete the work folders so the
+REM only exe left is the real one in dist\TwoPhotonScanner\.
+rmdir /s /q build 2>nul
+rmdir /s /q build_helper 2>nul
+rmdir /s /q dist_helper 2>nul
+
+echo.
 echo ============================================================
 echo DONE.  Ship this folder:   dist\TwoPhotonScanner\
-echo Users double-click:        TwoPhotonScanner.exe
+echo Users double-click:        dist\TwoPhotonScanner\TwoPhotonScanner.exe
 echo (Each rig PC needs the NI-DAQmx + H11890 USB drivers installed once.)
 echo ============================================================
 goto :eof

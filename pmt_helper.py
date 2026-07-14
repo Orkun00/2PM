@@ -29,6 +29,7 @@ Run it directly to self-test the bitness:
 import os
 import sys
 import json
+import time
 import ctypes
 
 
@@ -129,10 +130,23 @@ class RealPMT:
         self.dev.RN = rn
         self.dev.HVON = 1 if hv_on else 0
 
-        if not self.dll.H11890SetInf(ctypes.byref(self.dev)):
+        # The device may still be COUNTING from a previous session that died
+        # without CountStop -- SetInf fails on a counting device.
+        self.dll.H11890CountStop(self.handle)
+        self.counting = False
+
+        if not self._set_inf():
             raise RuntimeError("Could not configure PMT (H11890SetInf)")
         if not self.dll.H11890ReadInf(ctypes.byref(self.dev)):
             raise RuntimeError("Could not read PMT config (H11890ReadInf)")
+
+    def _set_inf(self):
+        """H11890SetInf with one retry -- the device sometimes needs a moment
+        (e.g. right after CountStop) before it accepts a new configuration."""
+        if self.dll.H11890SetInf(ctypes.byref(self.dev)):
+            return True
+        time.sleep(0.2)
+        return bool(self.dll.H11890SetInf(ctypes.byref(self.dev)))
 
     def serial(self):
         try:
@@ -169,8 +183,11 @@ class RealPMT:
         d.H11890CloseDevices.restype = None
 
     def start(self):
+        if self.counting:
+            return   # already counting (e.g. restored by reconfigure)
         if not self.dll.H11890CountStart(self.handle, 0):  # FALSE
             raise RuntimeError("Could not start PMT counting")
+        self.counting = True
 
     def read(self):
         gate = ctypes.c_uint32(0)
@@ -193,16 +210,28 @@ class RealPMT:
     def stop_counting(self):
         """Stop counting but leave the device OPEN for the next scan."""
         self.dll.H11890CountStop(self.handle)
+        self.counting = False
 
     def reconfigure(self, it_ms, rn, hv_on):
-        """Re-apply gate time / gate number / HV without reopening the device."""
+        """Re-apply gate time / gate number / HV without reopening the device.
+
+        H11890SetInf FAILS while the device is counting (and the GUI's live
+        monitor keeps it counting between scans), so stop counting first and
+        restore it afterwards.
+        """
+        was_counting = self.counting
+        self.dll.H11890CountStop(self.handle)
+        self.counting = False
+
         self.dev.IT = it_ms
         self.dev.RN = rn
         self.dev.HVON = 1 if hv_on else 0
-        if not self.dll.H11890SetInf(ctypes.byref(self.dev)):
+        if not self._set_inf():
             raise RuntimeError("Could not reconfigure PMT (H11890SetInf)")
         if not self.dll.H11890ReadInf(ctypes.byref(self.dev)):
             raise RuntimeError("Could not read PMT config (H11890ReadInf)")
+        if was_counting:
+            self.start()
 
     def close(self):
         try:
