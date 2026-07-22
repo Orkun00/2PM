@@ -600,9 +600,11 @@ class ScanEngine(threading.Thread):
 # GUI
 # ===========================================================================
 class ScannerGUI:
-    def __init__(self, root):
+    def __init__(self, root, app_window=None):
         self.root = root
-        root.title("2PM Raster Scanner  -  galvo + H11890 PMT")
+        self.app_window = app_window or root
+        if isinstance(root, (tk.Tk, tk.Toplevel)):
+            root.title("2PM Raster Scanner  -  galvo + H11890 PMT")
 
         self.q = queue.Queue()
         self.stop_event = threading.Event()
@@ -622,7 +624,8 @@ class ScannerGUI:
 
         self._build_widgets()
         self._poll_queue()
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        if isinstance(self.root, (tk.Tk, tk.Toplevel)):
+            self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ----- layout -----
     def _build_widgets(self):
@@ -905,7 +908,7 @@ class ScannerGUI:
         else:
             force = False
         self._close_hardware(force=force)
-        self.root.destroy()
+        self.app_window.destroy()
 
     # ----- live image -----
     def _init_image(self):
@@ -1047,9 +1050,508 @@ class ScannerGUI:
         self.status.set(f"Saved {len(self.records)} points -> {os.path.basename(path)}")
 
 
+
+# ===========================================================================
+# Galvo-only line exposure / burn tab
+# ===========================================================================
+def resample_polyline(points, step_deg):
+    """Return evenly spaced points along a line/polyline."""
+    if len(points) < 2:
+        return []
+    if step_deg <= 0:
+        raise ValueError("Path step must be > 0")
+
+    sampled = [points[0]]
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        dx, dy = x1 - x0, y1 - y0
+        distance = float(np.hypot(dx, dy))
+        if distance == 0:
+            continue
+        segments = max(1, int(np.ceil(distance / step_deg)))
+        for i in range(1, segments + 1):
+            t = i / segments
+            sampled.append((x0 + t * dx, y0 + t * dy))
+    return sampled
+
+
+class GalvoPathEngine(threading.Thread):
+    """Traverse a galvo-only line repeatedly, alternating forward and backward."""
+    def __init__(self, galvo, path_deg, pass_count, cfg, point_delay_ms,
+                 out_queue, stop_event):
+        super().__init__(daemon=True)
+        self.galvo = galvo
+        self.path_deg = path_deg
+        self.pass_count = pass_count
+        self.cfg = cfg
+        self.point_delay_ms = point_delay_ms
+        self.q = out_queue
+        self.stop_event = stop_event
+
+    def run(self):
+        try:
+            # The first traversal includes both endpoints. At each turnaround, the
+            # next traversal skips its first point because the galvo is already
+            # there; this avoids applying the per-point delay twice at an endpoint.
+            total = len(self.path_deg) + max(0, self.pass_count - 1) * max(0, len(self.path_deg) - 1)
+            overall_index = 0
+
+            for pass_index in range(self.pass_count):
+                direction = self.path_deg if pass_index % 2 == 0 else list(reversed(self.path_deg))
+                if pass_index > 0:
+                    direction = direction[1:]
+
+                for x_deg, y_deg in direction:
+                    if self.stop_event.is_set():
+                        self.q.put(("done", "stopped", pass_index + 1, self.pass_count))
+                        return
+
+                    vx = degree_to_voltage(self.cfg, x_deg)
+                    vy = degree_to_voltage(self.cfg, y_deg)
+                    self.galvo.write(vx, vy)
+                    self.q.put(("point", overall_index, total, pass_index + 1,
+                                self.pass_count, x_deg, y_deg, vx, vy))
+                    overall_index += 1
+                    if self.point_delay_ms:
+                        time.sleep(self.point_delay_ms / 1000.0)
+
+            # Intentionally hold the final point. Automatically returning to zero
+            # could draw an unwanted line if the laser is not blanked externally.
+            self.q.put(("done", "finished", self.pass_count, self.pass_count))
+        except Exception as exc:
+            self.q.put(("error", str(exc)))
+
+
+class GalvoBurnGUI:
+    """Galvo-only two-point line tab. It never opens or reads the PMT."""
+    def __init__(self, parent, imaging_gui):
+        self.parent = parent
+        self.imaging_gui = imaging_gui
+        self.galvo = None
+        self.hw_sig = None
+        self.engine = None
+        self.stop_event = threading.Event()
+        self.q = queue.Queue()
+        self.drawn_points = []
+        self.executed_path = []
+        self._build_widgets()
+        self._poll_queue()
+
+    def _build_widgets(self):
+        main = ttk.Frame(self.parent, padding=8)
+        main.pack(fill="both", expand=True)
+
+        controls = ttk.LabelFrame(main, text="Galvo-only line exposure", padding=8)
+        controls.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
+        plot_frame = ttk.LabelFrame(main, text="Select two endpoints (degrees)", padding=4)
+        plot_frame.grid(row=0, column=1, sticky="nsew")
+        main.columnconfigure(1, weight=1)
+        main.rowconfigure(0, weight=1)
+
+        self.vars = {
+            "display_range": tk.StringVar(value="5.0"),
+            "path_step": tk.StringVar(value="0.02"),
+            "point_delay": tk.StringVar(value="1.0"),
+            "pass_count": tk.StringVar(value="10"),
+            "voltage_limit": tk.StringVar(value="5.0"),
+            "degree_range": tk.StringVar(value="22.5"),
+            "channel_x": tk.StringVar(value="Dev1/ao0"),
+            "channel_y": tk.StringVar(value="Dev1/ao1"),
+        }
+
+        fields = [
+            ("Canvas half-range (deg)", "display_range"),
+            ("Path step (deg)", "path_step"),
+            ("Delay per point (ms)", "point_delay"),
+            ("Voltage limit (+/- V)", "voltage_limit"),
+            ("Degree range at full scale", "degree_range"),
+            ("X channel", "channel_x"),
+            ("Y channel", "channel_y"),
+        ]
+        for row, (label, key) in enumerate(fields):
+            ttk.Label(controls, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Entry(controls, textvariable=self.vars[key], width=14).grid(
+                row=row, column=1, sticky="w", pady=2)
+
+        row = len(fields)
+        self.sim_var = tk.BooleanVar(value=not HAVE_NIDAQMX)
+        ttk.Checkbutton(controls, text="Simulation mode (no hardware)",
+                        variable=self.sim_var).grid(row=row, column=0, columnspan=2,
+                                                    sticky="w", pady=(6, 2))
+        row += 1
+
+        warning = (
+            "IMPORTANT: this tab does not control a laser shutter/blanking line. "
+            "Keep the laser blocked while positioning, stopping, or changing paths."
+        )
+        ttk.Label(controls, text=warning, wraplength=280, foreground="#a00").grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(6, 8))
+        row += 1
+
+        ttk.Button(controls, text="Apply canvas range", command=self._reset_axes).grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=2)
+        row += 1
+        ttk.Button(controls, text="Undo last point", command=self.undo_stroke).grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=2)
+        row += 1
+        ttk.Button(controls, text="Clear path", command=self.clear_path).grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=2)
+        row += 1
+
+        self.run_btn = ttk.Button(controls, text="Run", command=self.run_single)
+        self.run_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(10, 2))
+        row += 1
+
+        self.run_multiple_btn = ttk.Button(
+            controls, text="Run multiple times", command=self.run_multiple)
+        self.run_multiple_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=2)
+        row += 1
+
+        ttk.Label(controls, text="Number of traversals").grid(
+            row=row, column=0, sticky="w", pady=2)
+        ttk.Entry(controls, textvariable=self.vars["pass_count"], width=14).grid(
+            row=row, column=1, sticky="w", pady=2)
+        row += 1
+
+        self.stop_btn = ttk.Button(controls, text="Stop", command=self.stop,
+                                   state="disabled")
+        self.stop_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=2)
+        row += 1
+        ttk.Button(controls, text="Park at 0,0", command=self.park_zero).grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=2)
+        row += 1
+        ttk.Button(controls, text="Release galvo", command=self.release_galvo).grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=2)
+        row += 1
+
+        self.status = tk.StringVar(value="Click once for the start point, then once for the end point.")
+        ttk.Label(controls, textvariable=self.status, wraplength=280).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(8, 2))
+        row += 1
+        self.progress = ttk.Progressbar(controls, length=260, mode="determinate")
+        self.progress.grid(row=row, column=0, columnspan=2, sticky="ew", pady=2)
+
+        self.fig = Figure(figsize=(7, 6))
+        self.ax = self.fig.add_subplot(111)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        NavigationToolbar2Tk(self.canvas, plot_frame).update()
+        self.path_line, = self.ax.plot([], [], marker="o", markersize=7)
+        self.cursor_point, = self.ax.plot([], [], marker="o", markersize=7)
+        self._reset_axes()
+
+        self.canvas.mpl_connect("button_press_event", self._on_press)
+
+    def _reset_axes(self):
+        try:
+            r = float(self.vars["display_range"].get())
+            if r <= 0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror("Bad range", "Canvas half-range must be > 0")
+            return
+        self.ax.set_xlim(-r, r)
+        self.ax.set_ylim(-r, r)
+        self.ax.set_aspect("equal", adjustable="box")
+        self.ax.set_xlabel("X angle (deg)")
+        self.ax.set_ylabel("Y angle (deg)")
+        self.ax.set_title("Click two endpoints to define a straight line")
+        self.ax.grid(True)
+        self.canvas.draw_idle()
+
+    def _on_press(self, event):
+        if event.button != 1 or event.inaxes != self.ax or self.engine is not None:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        point = (float(event.xdata), float(event.ydata))
+
+        # After a complete two-point line, the next click starts a new line.
+        if len(self.drawn_points) >= 2:
+            self.drawn_points = [point]
+            self.cursor_point.set_data([], [])
+            self.status.set(
+                f"Start point selected: ({point[0]:.3f}, {point[1]:.3f}) deg. "
+                "Click the end point.")
+        else:
+            self.drawn_points.append(point)
+            if len(self.drawn_points) == 1:
+                self.status.set(
+                    f"Start point selected: ({point[0]:.3f}, {point[1]:.3f}) deg. "
+                    "Click the end point.")
+            else:
+                p0, p1 = self.drawn_points
+                length = float(np.hypot(p1[0] - p0[0], p1[1] - p0[1]))
+                self.status.set(
+                    f"Line selected: ({p0[0]:.3f}, {p0[1]:.3f}) to "
+                    f"({p1[0]:.3f}, {p1[1]:.3f}) deg; length {length:.3f} deg.")
+        self._redraw_path()
+
+    def _redraw_path(self):
+        if not self.drawn_points:
+            self.path_line.set_data([], [])
+        else:
+            xs, ys = zip(*self.drawn_points)
+            self.path_line.set_data(xs, ys)
+        self.canvas.draw_idle()
+
+    def undo_stroke(self):
+        if self.engine is not None or not self.drawn_points:
+            return
+        self.drawn_points.pop()
+        self.cursor_point.set_data([], [])
+        self._redraw_path()
+        if len(self.drawn_points) == 1:
+            p = self.drawn_points[0]
+            self.status.set(
+                f"Start point remains: ({p[0]:.3f}, {p[1]:.3f}) deg. Click the end point.")
+        else:
+            self.status.set("No points selected. Click the start point.")
+
+    def clear_path(self):
+        if self.engine is not None:
+            return
+        self.drawn_points.clear()
+        self.executed_path.clear()
+        self.cursor_point.set_data([], [])
+        self._redraw_path()
+        self.status.set("Points cleared. Click the start point.")
+
+    def _config(self):
+        cfg = ScanConfig(
+            voltage_limit=float(self.vars["voltage_limit"].get()),
+            degree_range=float(self.vars["degree_range"].get()),
+            channel_x=self.vars["channel_x"].get().strip(),
+            channel_y=self.vars["channel_y"].get().strip(),
+            simulate=self.sim_var.get(),
+        )
+        if cfg.voltage_limit <= 0 or cfg.voltage_limit > 5.0:
+            raise ValueError("Voltage limit must be > 0 and no more than 5 V")
+        if cfg.degree_range <= 0:
+            raise ValueError("Degree range must be > 0")
+        return cfg
+
+    def _prepare_path(self, cfg):
+        if len(self.drawn_points) != 2:
+            raise ValueError("Select exactly two endpoints on the canvas")
+        if self.drawn_points[0] == self.drawn_points[1]:
+            raise ValueError("The start and end points must be different")
+
+        step = float(self.vars["path_step"].get())
+        path = resample_polyline(self.drawn_points, step)
+        if not path:
+            raise ValueError("The line is empty")
+        for x, y in path:
+            if abs(x) > cfg.degree_range or abs(y) > cfg.degree_range:
+                raise ValueError(
+                    f"Path point ({x:.2f}, {y:.2f}) exceeds +/-{cfg.degree_range:g} degrees")
+        return path
+
+    def _open_galvo(self, cfg):
+        sig = (cfg.simulate, cfg.channel_x, cfg.channel_y,
+               round(cfg.voltage_limit, 6), round(cfg.degree_range, 6))
+        if self.galvo is not None and sig == self.hw_sig:
+            return
+        self.release_galvo()
+        if cfg.simulate:
+            self.galvo = SimGalvo(cfg)
+        else:
+            if not HAVE_NIDAQMX:
+                raise RuntimeError("nidaqmx is not installed; enable Simulation mode")
+            self.galvo = RealGalvo(cfg)
+        self.hw_sig = sig
+
+    def run_single(self):
+        """Traverse the selected line exactly once, from start to end."""
+        self._start_run(pass_count=1)
+
+    def run_multiple(self):
+        """Traverse repeatedly, alternating start->end and end->start."""
+        try:
+            pass_count = int(self.vars["pass_count"].get())
+        except ValueError:
+            messagebox.showerror("Cannot run path", "Number of traversals must be an integer")
+            return
+        self._start_run(pass_count=pass_count)
+
+    def _start_run(self, pass_count):
+        if self.engine is not None:
+            return
+        if self.imaging_gui.engine is not None and self.imaging_gui.engine.is_alive():
+            messagebox.showerror("Scanner busy", "Stop the imaging scan before using galvo-only mode")
+            return
+        try:
+            cfg = self._config()
+            path = self._prepare_path(cfg)
+            delay = float(self.vars["point_delay"].get())
+            if delay < 0:
+                raise ValueError("Delay per point must be >= 0")
+            if pass_count < 1:
+                raise ValueError("Number of traversals must be at least 1")
+            if pass_count > 100000:
+                raise ValueError("Number of traversals is unreasonably large")
+            # The imaging tab keeps hardware open between scans. Release it before
+            # this tab claims the same NI-DAQ AO channels.
+            self.imaging_gui._close_hardware()
+            self._open_galvo(cfg)
+        except Exception as exc:
+            messagebox.showerror("Cannot run path", str(exc))
+            return
+
+        self.executed_path = path
+        self.stop_event.clear()
+        total_points = len(path) + max(0, pass_count - 1) * max(0, len(path) - 1)
+        self.progress.configure(maximum=total_points, value=0)
+        if pass_count == 1:
+            self.status.set(f"Running one traversal: {total_points} commands...")
+        else:
+            self.status.set(
+                f"Running {pass_count} traversals back and forth: {total_points} commands...")
+        self.engine = GalvoPathEngine(
+            self.galvo, path, pass_count, cfg, delay, self.q, self.stop_event)
+        self.engine.start()
+        self.run_btn.configure(state="disabled")
+        self.run_multiple_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+
+    def stop(self):
+        if self.engine is not None:
+            self.stop_event.set()
+            self.status.set("Stopping at the next path point...")
+            self.stop_btn.configure(state="disabled")
+
+    def park_zero(self):
+        if self.engine is not None:
+            messagebox.showinfo("Path running", "Stop the current pass first")
+            return
+        if self.galvo is None:
+            self.status.set("Galvo is not open.")
+            return
+        self.galvo.recenter()
+        self.cursor_point.set_data([0.0], [0.0])
+        self.canvas.draw_idle()
+        self.status.set("Galvo parked at 0,0. Ensure the laser is blocked during this move.")
+
+    def release_galvo(self):
+        if self.galvo is not None:
+            try:
+                self.galvo.close()
+            except Exception:
+                pass
+        self.galvo = None
+        self.hw_sig = None
+
+    def _poll_queue(self):
+        try:
+            while True:
+                msg = self.q.get_nowait()
+                if msg[0] == "point":
+                    _, index, total, pass_no, pass_total, x, y, vx, vy = msg
+                    self.progress.configure(value=index + 1)
+                    self.cursor_point.set_data([x], [y])
+                    direction = "forward" if pass_no % 2 == 1 else "backward"
+                    self.status.set(
+                        f"Traversal {pass_no}/{pass_total} ({direction}), command "
+                        f"{index + 1}/{total}: ({x:.3f}, {y:.3f}) deg, "
+                        f"({vx:.3f}, {vy:.3f}) V")
+                    self.canvas.draw_idle()
+                elif msg[0] == "done":
+                    _, result, completed, requested = msg
+                    self.engine = None
+                    self.run_btn.configure(state="normal")
+                    self.run_multiple_btn.configure(state="normal")
+                    self.stop_btn.configure(state="disabled")
+                    self.status.set(
+                        f"Run {result}: {completed}/{requested} traversal(s). "
+                        "The galvo is holding its final point.")
+                elif msg[0] == "error":
+                    self.engine = None
+                    self.run_btn.configure(state="normal")
+                    self.run_multiple_btn.configure(state="normal")
+                    self.stop_btn.configure(state="disabled")
+                    self.status.set("Galvo path error.")
+                    messagebox.showerror("Galvo path error", msg[1])
+        except queue.Empty:
+            pass
+        self.parent.after(50, self._poll_queue)
+
+    def close(self):
+        self.stop_event.set()
+        if self.engine is not None:
+            self.engine.join(timeout=2)
+        self.engine = None
+        self.release_galvo()
+
+    def stop_and_release_for_tab_change(self):
+        """Stop a burn run and release its AO task before another tab is used."""
+        self.stop_event.set()
+        if self.engine is not None:
+            self.engine.join(timeout=2)
+        self.engine = None
+        self.run_btn.configure(state="normal")
+        self.run_multiple_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.release_galvo()
+        self.status.set("Galvo released because the active tab changed.")
+
 def main():
     root = tk.Tk()
-    ScannerGUI(root)
+    root.title("2PM Scanner - Imaging and Galvo Path")
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill="both", expand=True)
+
+    imaging_tab = ttk.Frame(notebook)
+    burn_tab = ttk.Frame(notebook)
+    notebook.add(imaging_tab, text="Raster imaging")
+    notebook.add(burn_tab, text="Galvo line exposure")
+
+    imaging_gui = ScannerGUI(imaging_tab, app_window=root)
+    burn_gui = GalvoBurnGUI(burn_tab, imaging_gui)
+
+    active_tab = {"id": notebook.select()}
+    changing_tab = {"busy": False}
+
+    def release_hardware_on_tab_change(event=None):
+        # Tk fires this after selection changes. Stop any work from the previous
+        # tab, then close every galvo AO task before the newly selected tab can
+        # open one. This prevents both modes from retaining the same NI-DAQ AO
+        # channels across a tab transition.
+        if changing_tab["busy"]:
+            return
+        new_tab = notebook.select()
+        if new_tab == active_tab["id"]:
+            return
+        changing_tab["busy"] = True
+        try:
+            burn_gui.stop_and_release_for_tab_change()
+
+            imaging_gui.stop_event.set()
+            force = False
+            if imaging_gui.engine is not None:
+                imaging_gui.engine.join(timeout=3)
+                force = imaging_gui.engine.is_alive()
+            imaging_gui._close_hardware(force=force)
+            imaging_gui.engine = None
+            imaging_gui.start_btn.configure(state="normal")
+            imaging_gui.stop_btn.configure(state="disabled")
+            imaging_gui.status.set("Hardware released because the active tab changed.")
+
+            active_tab["id"] = new_tab
+        finally:
+            changing_tab["busy"] = False
+
+    notebook.bind("<<NotebookTabChanged>>", release_hardware_on_tab_change)
+
+    def close_all():
+        burn_gui.close()
+        imaging_gui.stop_event.set()
+        if imaging_gui.engine is not None:
+            imaging_gui.engine.join(timeout=2)
+        imaging_gui._close_hardware(force=(
+            imaging_gui.engine is not None and imaging_gui.engine.is_alive()))
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", close_all)
     root.mainloop()
 
 
