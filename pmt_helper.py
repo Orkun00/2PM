@@ -2,142 +2,167 @@
 """
 pmt_helper.py
 =============
-32-BIT side of the two-photon scanner.
+32-bit H11890 helper for the two-photon scanner.
 
-H11890api.dll is x86 (32-bit) only, so it can only be loaded by a 32-bit
-Python via ctypes. matplotlib no longer ships 32-bit Windows wheels, so the
-GUI (two_photon_scanner.py) runs in 64-bit Python instead. This little program
-is the bridge: the 64-bit GUI launches it with 32-bit Python as a child
-process and talks to it over stdin/stdout using one JSON object per line.
+FAST SINGLE-GATE MODE
+---------------------
+The H11890api.dll is x86 (32-bit), while the GUI runs in 64-bit Python.
+This helper stays alive as a 32-bit child process and exposes a tiny
+JSON-over-stdio protocol.
 
-It speaks NOTHING else on stdout -- only protocol replies -- so the parent can
-parse every line. Anything informational goes to stderr.
+The fast acquisition path is ONE RPC per pixel:
 
-Protocol (one JSON object per line, request -> reply):
-  {"cmd":"ping"}                         -> {"ok":true,"bits":32}
-  {"cmd":"open","dll_path":..,"it":1,
-        "rn":0,"hvon":1}                 -> {"ok":true,"serial":".."} | {"ok":false,"error":..}
-  {"cmd":"start"}                        -> {"ok":true} | {"ok":false,"error":..}
-  {"cmd":"read"}                         -> {"ok":true,"count":N,"over":0,"gate":G}
-  {"cmd":"close"}                        -> {"ok":true}
-  {"cmd":"quit"}                         -> (process exits)
+    {"cmd":"measure"}
 
-Run it directly to self-test the bitness:
-  py -3.13-32 pmt_helper.py        (then type  {"cmd":"ping"}  + Enter)
+Inside the helper that becomes:
+
+    H11890CountStart()
+    precise wait for IT + guard
+    H11890ReadData()
+    return DataBuf[0]
+
+This matches the physical H11890 test performed on the microscope:
+with IT=1 ms and RN=1, DataBuf[0] contained the single-gate count while
+DataBuf[1:15] remained zero. The measured CountStart -> result latency was
+typically about 1.6-1.7 ms.
+
+Important:
+- Fast mode requires RN=1 (one finite gate per CountStart).
+- No H11890CountStop() is used in the normal path. It was observed to be
+  capable of blocking, and RN=1 ends by itself after one gate.
+- The helper does NOT call time.sleep(0.001) for the 1 ms gate delay because
+  Windows scheduling produced multi-ms overshoots in testing.
+- HV is still controlled by the GUI and is OFF unless requested.
+
+Protocol:
+  {"cmd":"ping"}
+  {"cmd":"open","dll_path":"H11890api.dll","it":1,"rn":1,"hvon":0}
+  {"cmd":"measure"}
+  {"cmd":"reconfig","it":1,"rn":1,"hvon":0}
+  {"cmd":"close"}
+  {"cmd":"quit"}
+
+Compatibility:
+  "read" is treated as "measure", "start" and "stop" are harmless no-ops.
 """
 
+import ctypes
+import json
 import os
 import sys
-import json
-import ctypes
+import time
 
 
-# ---------------------------------------------------------------------------
-# H11890 ctypes binding -- matched to H11890api.h.
-#   struct _H11890_INF { HANDLE hDeviceHandle; CHAR cSerialNumber[10];
-#                        DWORD IT; DWORD RN; BOOL HVON; }
-#   All exports are extern "C" __stdcall  -> use WinDLL.
-#   H11890SetInf / H11890ReadInf take H11890_INF& -> pass ctypes.byref().
-# ---------------------------------------------------------------------------
+# Extra delay after the requested hardware gate duration before ReadData.
+# The physical test used ~1.05 ms for a 1 ms gate and returned the real count.
+READ_GUARD_MS = 0.05
+
+
 class H11890_INF(ctypes.Structure):
     _fields_ = [
-        ("hDeviceHandle", ctypes.c_void_p),     # HANDLE
-        ("cSerialNumber", ctypes.c_char * 10),  # CHAR cSerialNumber[10]
-        ("IT", ctypes.c_uint32),                # DWORD: gate time, 1..10000 ms
-        ("RN", ctypes.c_uint32),                # DWORD: gate number, 0 = continuous
-        ("HVON", ctypes.c_int32),               # BOOL: high voltage on/off
+        ("hDeviceHandle", ctypes.c_void_p),
+        ("cSerialNumber", ctypes.c_char * 10),
+        ("IT", ctypes.c_uint32),
+        ("RN", ctypes.c_uint32),
+        ("HVON", ctypes.c_int32),
     ]
 
 
 def load_h11890_dll(path):
-    """
-    Load H11890api.dll robustly.
-
-    Handles the two classic Windows failures:
-      * Python 3.8+ does NOT add the DLL's own folder to the dependency search
-        path, so sibling dependency DLLs (USB/FTDI driver, etc.) aren't found
-        even when they sit right next to H11890api.dll. We add it explicitly.
-      * Distinguishes 'missing dependency' (WinError 126) from 'wrong bitness'
-        (WinError 193) so the error message is actually useful.
-    """
-    # H11890api.dll is 32-bit (x86) only -> this Python must also be 32-bit.
+    """Load the 32-bit H11890 DLL and its dependencies robustly."""
     bits = ctypes.sizeof(ctypes.c_void_p) * 8
     if bits != 32:
         raise OSError(
             f"pmt_helper.py is running under {bits}-bit Python, but "
-            "H11890api.dll is 32-bit (x86) only. Launch the helper with 32-bit "
-            "Python, e.g.  py -3.13-32 pmt_helper.py  (the GUI does this for "
-            "you via the 'Helper Python' field).")
+            "H11890api.dll is 32-bit (x86) only. Launch with 32-bit Python, "
+            "for example: py -3.13-32 pmt_helper.py"
+        )
 
-    # Resolve the path: as given, then relative to CWD, then next to this script.
-    here = os.path.dirname(os.path.abspath(__file__))
+    if getattr(sys, "frozen", False):
+        here = os.path.dirname(sys.executable)
+    else:
+        here = os.path.dirname(os.path.abspath(__file__))
+
     candidates = [path, os.path.abspath(path), os.path.join(here, path)]
     dll_file = next((c for c in candidates if os.path.isfile(c)), None)
+
     if dll_file is None:
         raise FileNotFoundError(
-            "H11890api.dll not found. Looked in:\n  " + "\n  ".join(candidates))
+            "H11890api.dll not found. Looked in:\n  " + "\n  ".join(candidates)
+        )
 
-    # Use the ABSOLUTE path. A bare/relative name (which happens when the
-    # working dir already is the DLL's folder) leaves dll_dir == "" and skips
-    # add_dll_directory below -> Windows then can't find libusb0.dll -> 126.
     dll_file = os.path.abspath(dll_file)
     dll_dir = os.path.dirname(dll_file)
+
     if hasattr(os, "add_dll_directory") and os.path.isdir(dll_dir):
-        os.add_dll_directory(dll_dir)   # let Windows find the dependency DLLs
+        os.add_dll_directory(dll_dir)
 
     try:
-        return ctypes.WinDLL(dll_file)   # extern "C" __stdcall
+        return ctypes.WinDLL(dll_file)
     except OSError as e:
         win = getattr(e, "winerror", None)
         msg = str(e)
+
         if win == 193:
             raise OSError(
-                "WinError 193: bitness mismatch. H11890api.dll is 32-bit (x86) "
-                "ONLY, so the helper MUST run under 32-bit Python.") from e
-        # Python 3.8+ sometimes reports the dependency failure as a
-        # FileNotFoundError with no .winerror set, so match the text too.
+                "WinError 193: bitness mismatch. H11890api.dll is 32-bit "
+                "(x86), so the helper must run under 32-bit Python."
+            ) from e
+
         if win == 126 or "or one of its dependencies" in msg:
             raise OSError(
-                "WinError 126: H11890api.dll loaded but its dependency "
-                "'libusb0.dll' (32-bit) was not found. Install the H11890 USB "
-                "driver (RS SampleSoftware\\driver\\UPDATE_x86.exe) -- it puts the "
-                "32-bit libusb0.dll in C:\\Windows\\SysWOW64. Or copy that "
-                "SysWOW64\\libusb0.dll next to this script. Do NOT use the 64-bit "
-                "libusb0.dll from driver\\x64.") from e
+                "WinError 126: a 32-bit dependency (normally libusb0.dll) "
+                "could not be found. Install the H11890 x86 driver or place "
+                "the correct 32-bit libusb0.dll where Windows can load it."
+            ) from e
+
         raise
 
 
+def precise_wait_ms(delay_ms):
+    """
+    Wait until a high-resolution deadline.
+
+    For the ~1.05 ms fast path this is a pure busy-wait, avoiding the several-ms
+    scheduling outliers observed with time.sleep(0.001) on the microscope PC.
+    For longer waits, sleep coarsely first and spin only the final ~0.5 ms.
+    """
+    delay_ms = float(delay_ms)
+    if delay_ms <= 0:
+        return
+
+    deadline = time.perf_counter_ns() + int(delay_ms * 1_000_000)
+
+    # Keep the latency-critical 1 ms case entirely deterministic.
+    if delay_ms > 2.0:
+        coarse_ms = delay_ms - 0.5
+        time.sleep(coarse_ms / 1000.0)
+
+    while time.perf_counter_ns() < deadline:
+        pass
+
+
 class RealPMT:
-    """ctypes wrapper around H11890api.dll (32-bit, Windows only)."""
-    def __init__(self, dll_path, it_ms, rn, hv_on):
-        self.dll = load_h11890_dll(dll_path)   # stdcall; CDLL if it were cdecl
+    """ctypes wrapper around H11890api.dll in RN=1 single-gate mode."""
+
+    def __init__(self, dll_path, it_ms=1, rn=1, hv_on=False):
+        self.dll = load_h11890_dll(dll_path)
         self._bind()
 
         self.pmt = (H11890_INF * 16)()
-        n = self.dll.H11890OpenDevices(self.pmt)
+        n = int(self.dll.H11890OpenDevices(self.pmt))
         if n <= 0:
             raise RuntimeError("Could not open H11890 PMT device (none found)")
 
         self.dev = self.pmt[0]
         self.handle = self.dev.hDeviceHandle
+        self.measurement_index = 0
 
-        self.dev.IT = it_ms
-        self.dev.RN = rn
-        self.dev.HVON = 1 if hv_on else 0
-
-        if not self.dll.H11890SetInf(ctypes.byref(self.dev)):
-            raise RuntimeError("Could not configure PMT (H11890SetInf)")
-        if not self.dll.H11890ReadInf(ctypes.byref(self.dev)):
-            raise RuntimeError("Could not read PMT config (H11890ReadInf)")
-
-    def serial(self):
-        try:
-            return self.dev.cSerialNumber.decode("ascii", "ignore").strip("\x00")
-        except Exception:
-            return ""
+        self._apply_config(it_ms, rn, hv_on)
 
     def _bind(self):
         d = self.dll
+
         d.H11890OpenDevices.argtypes = [ctypes.POINTER(H11890_INF)]
         d.H11890OpenDevices.restype = ctypes.c_uint32
 
@@ -150,73 +175,160 @@ class RealPMT:
         d.H11890CountStart.argtypes = [ctypes.c_void_p, ctypes.c_int32]
         d.H11890CountStart.restype = ctypes.c_int32
 
+        # Bound for completeness/recovery diagnostics, but intentionally unused
+        # in the normal RN=1 path.
         d.H11890CountStop.argtypes = [ctypes.c_void_p]
         d.H11890CountStop.restype = ctypes.c_int32
 
         d.H11890ReadData.argtypes = [
             ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_uint32),       # gateNum
-            ctypes.POINTER(ctypes.c_uint32),       # dataBuf[16]
-            ctypes.POINTER(ctypes.c_int32),        # overLight (BOOL)
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_int32),
         ]
         d.H11890ReadData.restype = ctypes.c_uint32
 
         d.H11890CloseDevices.argtypes = [ctypes.POINTER(H11890_INF)]
         d.H11890CloseDevices.restype = None
 
-    def start(self):
-        if not self.dll.H11890CountStart(self.handle, 0):  # FALSE
-            raise RuntimeError("Could not start PMT counting")
+    def _set_inf(self):
+        if self.dll.H11890SetInf(ctypes.byref(self.dev)):
+            return True
+        # A short retry handles transient SetInf timing without CountStop().
+        time.sleep(0.02)
+        return bool(self.dll.H11890SetInf(ctypes.byref(self.dev)))
 
-    def read(self):
-        import time as _time
+    def _apply_config(self, it_ms, rn, hv_on):
+        it_ms = int(it_ms)
+        rn = int(rn)
+
+        if it_ms < 1 or it_ms > 10000:
+            raise ValueError("H11890 gate time IT must be 1..10000 ms")
+
+        if rn != 1:
+            raise ValueError(
+                "Fast single-gate scanner requires PMT gate number RN=1. "
+                "Set 'PMT gate number' to 1."
+            )
+
+        self.dev.IT = it_ms
+        self.dev.RN = 1
+        self.dev.HVON = 1 if hv_on else 0
+
+        if not self._set_inf():
+            raise RuntimeError(
+                "Could not configure H11890 (H11890SetInf). If the device was "
+                "left in the old RN=0 continuous mode by a previous crashed "
+                "program, unplug/replug its USB cable once and retry."
+            )
+
+        if not self.dll.H11890ReadInf(ctypes.byref(self.dev)):
+            raise RuntimeError("Could not read H11890 configuration")
+
+        if int(self.dev.IT) != it_ms or int(self.dev.RN) != 1:
+            raise RuntimeError(
+                f"H11890 configuration mismatch: IT={self.dev.IT}, RN={self.dev.RN}"
+            )
+
+    def serial(self):
+        try:
+            return self.dev.cSerialNumber.decode("ascii", "ignore").strip("\x00")
+        except Exception:
+            return ""
+
+    def measure_once(self):
+        """
+        Acquire exactly one finite gate.
+
+        Tested fast sequence:
+            CountStart -> wait IT + 0.05 ms -> ReadData -> DataBuf[0]
+
+        H11890ReadData may report n=15 for short gate times even with RN=1.
+        On the physical unit, only DataBuf[0] contained the RN=1 measurement.
+        """
+        total_t0 = time.perf_counter_ns()
+
+        start_t0 = total_t0
+        if not self.dll.H11890CountStart(self.handle, 0):
+            raise RuntimeError("Could not start H11890 single-gate measurement")
+        start_t1 = time.perf_counter_ns()
+
+        requested_wait_ms = float(self.dev.IT) + READ_GUARD_MS
+        wait_t0 = time.perf_counter_ns()
+        precise_wait_ms(requested_wait_ms)
+        wait_t1 = time.perf_counter_ns()
+
         gate = ctypes.c_uint32(0)
         buf = (ctypes.c_uint32 * 16)()
         over = ctypes.c_int32(0)
-        _t0 = _time.perf_counter()
-        n = self.dll.H11890ReadData(self.handle, ctypes.byref(gate), buf,
-                                    ctypes.byref(over))
-        _usb_ms = 1e3 * (_time.perf_counter() - _t0)
-        # DIAGNOSTIC: time the raw USB/DLL call only. stdout is protocol-only,
-        # so log to a sibling file. Remove this block once the bottleneck is found.
-        try:
-            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   "pmt_timing.log"), "a") as _lf:
-                _lf.write(f"H11890ReadData {_usb_ms:.2f} ms\n")
-        except Exception:
-            pass
-        if ctypes.c_int32(n).value < 0:
-            return -1, 0, gate.value
-        # one pixel per galvo position -> take the first gate's count
-        return int(buf[0]), int(over.value), int(gate.value)
+
+        read_t0 = time.perf_counter_ns()
+        n_raw = self.dll.H11890ReadData(
+            self.handle,
+            ctypes.byref(gate),
+            buf,
+            ctypes.byref(over),
+        )
+        read_t1 = time.perf_counter_ns()
+
+        n = ctypes.c_int32(n_raw).value
+        if n not in (1, 15):
+            raise RuntimeError(f"H11890ReadData failed/unexpected return value: {n}")
+
+        self.measurement_index += 1
+
+        # Empirically verified for IT=1 ms, RN=1 on serial 30430560:
+        # buf[0] is the actual single-gate photon count; remaining slots are 0.
+        count = int(buf[0])
+
+        return {
+            "count": count,
+            "over": int(over.value),
+            "hw_gate": int(gate.value),
+            "measurement": self.measurement_index,
+            "n": int(n),
+            "start_ms": (start_t1 - start_t0) / 1_000_000.0,
+            "wait_ms": (wait_t1 - wait_t0) / 1_000_000.0,
+            "read_ms": (read_t1 - read_t0) / 1_000_000.0,
+            "elapsed_ms": (read_t1 - total_t0) / 1_000_000.0,
+        }
+
+    # Compatibility methods. The scanner now uses measure_once directly.
+    def start(self):
+        # RN=1 is finite and must be started separately for every pixel.
+        return
+
+    def read(self):
+        return self.measure_once()
 
     def stop_counting(self):
-        """Stop counting but leave the device OPEN for the next scan."""
-        self.dll.H11890CountStop(self.handle)
+        # Nothing to stop in RN=1 mode; avoiding CountStop also avoids the
+        # blocking behavior observed during testing.
+        return
 
     def reconfigure(self, it_ms, rn, hv_on):
-        """Re-apply gate time / gate number / HV without reopening the device."""
-        self.dev.IT = it_ms
-        self.dev.RN = rn
-        self.dev.HVON = 1 if hv_on else 0
-        if not self.dll.H11890SetInf(ctypes.byref(self.dev)):
-            raise RuntimeError("Could not reconfigure PMT (H11890SetInf)")
-        if not self.dll.H11890ReadInf(ctypes.byref(self.dev)):
-            raise RuntimeError("Could not read PMT config (H11890ReadInf)")
+        # stdin commands are processed sequentially; a measure command is fully
+        # complete before reconfiguration can run, so no CountStop is needed.
+        self._apply_config(it_ms, rn, hv_on)
+
+    def set_hv_off_best_effort(self):
+        try:
+            self.dev.RN = 1
+            self.dev.HVON = 0
+            return bool(self._set_inf())
+        except Exception:
+            return False
 
     def close(self):
-        try:
-            self.dll.H11890CountStop(self.handle)
-        finally:
-            self.dll.H11890CloseDevices(self.pmt)
+        # Normal shutdown is safe because every RN=1 measurement is finite.
+        # Try to turn HV off before releasing the device. Never call CountStop().
+        self.set_hv_off_best_effort()
+        self.dll.H11890CloseDevices(self.pmt)
 
 
-# ---------------------------------------------------------------------------
-# JSON-over-stdio command loop
-# ---------------------------------------------------------------------------
 def reply(obj):
-    """Write exactly one JSON line to stdout and flush it."""
-    sys.stdout.write(json.dumps(obj) + "\n")
+    """Write exactly one JSON reply line and flush immediately."""
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 
 
@@ -228,6 +340,7 @@ def main():
         line = line.strip()
         if not line:
             continue
+
         try:
             msg = json.loads(line)
         except Exception as e:
@@ -235,9 +348,15 @@ def main():
             continue
 
         cmd = msg.get("cmd")
+
         try:
             if cmd == "ping":
-                reply({"ok": True, "bits": bits})
+                reply({
+                    "ok": True,
+                    "bits": bits,
+                    "mode": "RN1-single-gate",
+                    "guard_ms": READ_GUARD_MS,
+                })
 
             elif cmd == "open":
                 if pmt is not None:
@@ -246,42 +365,54 @@ def main():
                     except Exception:
                         pass
                     pmt = None
+
                 pmt = RealPMT(
                     dll_path=msg.get("dll_path", "H11890api.dll"),
                     it_ms=int(msg.get("it", 1)),
-                    rn=int(msg.get("rn", 0)),
-                    hv_on=bool(msg.get("hvon", 1)),
+                    rn=int(msg.get("rn", 1)),
+                    hv_on=bool(msg.get("hvon", 0)),
                 )
-                reply({"ok": True, "serial": pmt.serial()})
+                reply({
+                    "ok": True,
+                    "serial": pmt.serial(),
+                    "it": int(pmt.dev.IT),
+                    "rn": int(pmt.dev.RN),
+                    "hvon": bool(pmt.dev.HVON),
+                })
+
+            elif cmd in ("measure", "read"):
+                if pmt is None:
+                    reply({"ok": False, "error": "device not open"})
+                else:
+                    r = pmt.measure_once()
+                    reply({"ok": True, **r})
 
             elif cmd == "start":
+                # Compatibility no-op: every RN=1 pixel starts inside measure.
                 if pmt is None:
                     reply({"ok": False, "error": "device not open"})
                 else:
-                    pmt.start()
-                    reply({"ok": True})
+                    reply({"ok": True, "mode": "single-gate"})
 
             elif cmd == "stop":
-                if pmt is None:
-                    reply({"ok": False, "error": "device not open"})
-                else:
-                    pmt.stop_counting()
-                    reply({"ok": True})
+                # Compatibility no-op: RN=1 acquisition is already finite.
+                reply({"ok": True})
 
             elif cmd == "reconfig":
                 if pmt is None:
                     reply({"ok": False, "error": "device not open"})
                 else:
-                    pmt.reconfigure(int(msg.get("it", 1)), int(msg.get("rn", 0)),
-                                    bool(msg.get("hvon", 1)))
-                    reply({"ok": True})
-
-            elif cmd == "read":
-                if pmt is None:
-                    reply({"ok": False, "error": "device not open"})
-                else:
-                    count, over, gate = pmt.read()
-                    reply({"ok": True, "count": count, "over": over, "gate": gate})
+                    pmt.reconfigure(
+                        int(msg.get("it", 1)),
+                        int(msg.get("rn", 1)),
+                        bool(msg.get("hvon", 0)),
+                    )
+                    reply({
+                        "ok": True,
+                        "it": int(pmt.dev.IT),
+                        "rn": int(pmt.dev.RN),
+                        "hvon": bool(pmt.dev.HVON),
+                    })
 
             elif cmd == "close":
                 if pmt is not None:
@@ -298,7 +429,6 @@ def main():
         except Exception as e:
             reply({"ok": False, "error": str(e)})
 
-    # final cleanup on quit / EOF
     if pmt is not None:
         try:
             pmt.close()
